@@ -1,13 +1,13 @@
 // ============================================================
 // server.js — AI-Powered PPT Generator Backend
-// Stack: Express, Gemini API, PptxGenJS
+// Stack: Express, NVIDIA NIM API (Nemotron), PptxGenJS
 // ============================================================
 
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import PptxGenJS from "pptxgenjs";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import OpenAI from "openai";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -19,9 +19,15 @@ const PORT = process.env.PORT || 5000;
 app.use(cors()); // Allow all origins (restrict in prod if needed)
 app.use(express.json()); // Parse JSON request bodies
 
-// ─── Gemini Client ───────────────────────────────────────────
-// Make sure GEMINI_API_KEY is set in your .env file
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// ─── NVIDIA NIM Client ───────────────────────────────────────
+// Uses OpenAI-compatible API pointed at NVIDIA's inference endpoint.
+// Get your free API key at: https://build.nvidia.com
+const nvidia = new OpenAI({
+  apiKey: process.env.NVIDIA_API_KEY,
+  baseURL: "https://integrate.api.nvidia.com/v1",
+});
+
+const MODEL = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1";
 
 // ─── Theme Config ────────────────────────────────────────────
 // Defines background and text colors for Light/Dark themes
@@ -44,9 +50,9 @@ const THEMES = {
   },
 };
 
-// ─── Helper: Extract JSON from Gemini Response ───────────────
+// ─── Helper: Extract JSON from AI Response ───────────────────
 /**
- * Gemini sometimes wraps JSON in markdown code fences like ```json ... ```
+ * The model sometimes wraps JSON in markdown code fences like ```json ... ```
  * This function safely extracts the raw JSON array from the response text.
  */
 function extractJSON(text) {
@@ -208,7 +214,7 @@ app.post("/generate", async (req, res) => {
   );
 
   try {
-    // ── 1. Build Gemini Prompt ──────────────────────────────
+    // ── 1. Build Prompt ──────────────────────────────────────
     const prompt = `
 You are an expert presentation creator. Generate a ${slideCount}-slide presentation on the topic: "${topic}".
 
@@ -234,28 +240,25 @@ Rules:
 - Output ONLY the JSON array. No other text.
 `.trim();
 
-    // ── 2. Call Gemini API (with model fallback) ────────────
-    // Try models in order — some keys may not have access to all models
-    const MODELS_TO_TRY = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-pro"];
-    let responseText = null;
+    // ── 2. Call NVIDIA NIM API ───────────────────────────────
+    // Model: llama-3.1-nemotron-nano-vl-8b-v1
+    // Docs:  https://build.nvidia.com/nvidia/llama-3_1-nemotron-nano-vl-8b-v1
+    console.log(`[NVIDIA] Calling model: ${MODEL}`);
 
-    for (const modelName of MODELS_TO_TRY) {
-      try {
-        console.log(`[Gemini] Trying model: ${modelName}`);
-        const model = genAI.getGenerativeModel({ model: modelName });
-        const result = await model.generateContent(prompt);
-        responseText = result.response.text();
-        console.log(`[Gemini] ✅ Success with model: ${modelName}`);
-        break; // Stop trying once one succeeds
-      } catch (modelErr) {
-        console.warn(`[Gemini] ❌ Model "${modelName}" failed: ${modelErr.message}`);
-        if (modelName === MODELS_TO_TRY[MODELS_TO_TRY.length - 1]) {
-          throw new Error(`All Gemini models failed. Last error: ${modelErr.message}`);
-        }
-      }
-    }
+    const completion = await nvidia.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      temperature: 0.7,
+      max_tokens: 4096,
+    });
 
-    console.log("[Gemini] Raw response received.");
+    const responseText = completion.choices[0]?.message?.content || "";
+    console.log(`[NVIDIA] ✅ Response received from ${MODEL}`);
 
     // ── 3. Parse JSON Safely ──────────────────────────────
     let slides;
@@ -271,10 +274,9 @@ Rules:
       if (slides.length === 0) throw new Error("No valid slides in response.");
     } catch (parseErr) {
       console.error("[Parse Error]", parseErr.message);
-      console.error("[Raw Gemini Text]", responseText);
+      console.error("[Raw AI Response]", responseText);
       return res.status(500).json({
-        error:
-          "Failed to parse Gemini response as valid JSON. Please try again.",
+        error: "Failed to parse AI response as valid JSON. Please try again.",
         details: parseErr.message,
       });
     }
@@ -296,11 +298,11 @@ Rules:
     console.error("[Server Error] Message:", err.message);
     if (err.status) console.error("[Server Error] HTTP Status:", err.status);
     if (err.statusText) console.error("[Server Error] Status Text:", err.statusText);
-    if (err.errorDetails) console.error("[Server Error] Details:", JSON.stringify(err.errorDetails, null, 2));
+    if (err.error) console.error("[Server Error] Details:", JSON.stringify(err.error, null, 2));
     console.error("[Server Error] ========================================\n");
 
     res.status(500).json({
-      error: "Internal server error. Please check your API key and try again.",
+      error: "Internal server error. Please check your NVIDIA API key and try again.",
       details: err.message,
     });
   }
@@ -308,12 +310,17 @@ Rules:
 
 // ─── Health Check ─────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    model: MODEL,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ─── Start Server ─────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+  console.log(`   Model:        ${MODEL}`);
   console.log(`   Health check: http://localhost:${PORT}/health`);
   console.log(`   Generate PPT: POST http://localhost:${PORT}/generate\n`);
 });
